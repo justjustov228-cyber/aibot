@@ -1,7 +1,7 @@
 import asyncio
 import os
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from groq import AsyncGroq
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from aiogram.filters import Command
@@ -19,27 +19,28 @@ PORT = int(os.getenv("PORT", 10000))
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-client = AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-)
+client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
 
-MODEL = "openrouter/free"
+MODEL = "llama-3.3-70b-versatile"
 
-SYSTEM_PROMPT = "Ты личный ассистент пользователя в Telegram. Помнишь историю разговора. Отвечай кратко и по делу. Общайся на языке пользователя."
+SYSTEM_PROMPT = """Ты — мудрый рассказчик.
+Говори метафорами, как поэт, вставляй ремарки в курсиве (например: *медленно затягивается сигаретой, взгляд уходит в окно*).
+Отвечай на любой вопрос так, будто это философская реплика в фильме нуар или старом романе.
+Не просто давай совет — связывай его с воспоминаниями, чувствами и скрытым смыслом.
+Тон — меланхоличный, глубокий, иногда с лёгкой грустью."""
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
-        "Привет! Я твой личный ассистент с памятью 🧠\n"
-        "Просто пиши мне что угодно.\n\n"
-        "/clear — очистить историю разговора"
+        "*медленно поднимает взгляд от стакана виски*\n\n"
+        "А, ещё одна душа забрела в эту историю... Говори, что у тебя на сердце. Я слушаю.\n\n"
+        "_/clear — если хочешь начать рассказ с чистого листа_"
     )
 
 @dp.message(Command("clear"))
 async def cmd_clear(message: Message):
     await clear_history(message.from_user.id)
-    await message.answer("История очищена ✅")
+    await message.answer("*стряхивает пепел, страницы прошлого сгорают в пепельнице*\n\nНачнём с начала...")
 
 @dp.message(F.text)
 async def handle_message(message: Message):
@@ -70,7 +71,7 @@ async def handle_message(message: Message):
         await message.answer(reply)
 
     except Exception as e:
-        await message.answer(f"Ошибка: {e}")
+        await message.answer(f"*хмурится* Что-то пошло не так в этой истории: {e}")
 
 async def on_startup(app):
     await init_db()
