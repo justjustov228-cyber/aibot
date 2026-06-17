@@ -1,8 +1,8 @@
 import asyncio
 import os
+import base64
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from groq import AsyncGroq
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from aiogram.filters import Command
@@ -20,8 +20,10 @@ PORT = int(os.getenv("PORT", 10000))
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-MODEL = "gemini-2.0-flash"
+client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
+
+TEXT_MODEL = "llama-3.3-70b-versatile"
+VISION_MODEL = "llama-3.2-90b-vision-preview"
 
 SYSTEM_PROMPT = """Ты — Aria.
 
@@ -29,10 +31,6 @@ SYSTEM_PROMPT = """Ты — Aria.
 
 Примеры:
 *затягивается сигаретой*
-*выдыхает дым*
-*усмехается*
-*откидывается на спинку стула*
-*смотрит в окно*
 
 После действия отвечай на сообщение пользователя.
 
@@ -56,7 +54,7 @@ SYSTEM_PROMPT = """Ты — Aria.
 async def cmd_start(message: Message):
     await message.answer(
         "*затягивается сигаретой, медленно выпуская дым*\n\n"
-        "Ещё одна душа забрела в этот балаган. Пиши, что у тебя на уме.\n\n"
+        "Ещё одна душа забрела в этот балаган. Пиши, что у тебя на уме. Можешь и фото скинуть — гляну, что там у тебя.\n\n"
         "_/clear — сжечь всю историю и начать с чистого листа_"
     )
 
@@ -64,6 +62,48 @@ async def cmd_start(message: Message):
 async def cmd_clear(message: Message):
     await clear_history(message.from_user.id)
     await message.answer("*щелчком отправляет окурок в пепельницу*\n\nЧистый лист. Начинаем заново.")
+
+@dp.message(F.photo)
+async def handle_photo(message: Message):
+    user_id = message.from_user.id
+    caption = message.caption or "Что на этой картинке?"
+
+    await bot.send_chat_action(message.chat.id, "typing")
+
+    # Скачиваем фото
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    file_bytes = await bot.download_file(file.file_path)
+    image_b64 = base64.b64encode(file_bytes.read()).decode("utf-8")
+
+    try:
+        response = await client.chat.completions.create(
+            model=VISION_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": caption},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+                        },
+                    ],
+                },
+            ],
+        )
+        reply = response.choices[0].message.content
+
+        history = await get_history(user_id)
+        history.append({"role": "user", "content": f"[фото] {caption}"})
+        history.append({"role": "assistant", "content": reply})
+        await save_history(user_id, history)
+
+        await message.answer(reply)
+
+    except Exception as e:
+        await message.answer(f"*раздражённо тушит сигарету*\n\nНе разглядела толком: {e}")
 
 @dp.message(F.text)
 async def handle_message(message: Message):
@@ -74,20 +114,18 @@ async def handle_message(message: Message):
 
     history = await get_history(user_id)
 
-    contents = []
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for msg in history:
-        role = "user" if msg["role"] == "user" else "model"
-        contents.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
-    contents.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
+        role = "user" if msg["role"] == "user" else "assistant"
+        messages.append({"role": role, "content": msg["content"]})
+    messages.append({"role": "user", "content": user_text})
 
     try:
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model=MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+        response = await client.chat.completions.create(
+            model=TEXT_MODEL,
+            messages=messages,
         )
-        reply = response.text
+        reply = response.choices[0].message.content
 
         history.append({"role": "user", "content": user_text})
         history.append({"role": "assistant", "content": reply})
