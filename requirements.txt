@@ -1,5 +1,5 @@
 aiogram==3.13.1
-groq
+google-genai
 python-dotenv
 aiosqlite
 aiohttp
