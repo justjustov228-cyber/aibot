@@ -1,5 +1,5 @@
-aiogram==3.7.0
-google-generativeai
+aiogram==3.13.1
+openai
 python-dotenv
 aiosqlite
 aiohttp
