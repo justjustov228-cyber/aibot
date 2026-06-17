@@ -1,7 +1,7 @@
 import asyncio
 import os
 from dotenv import load_dotenv
-import google.generativeai as genai
+from openai import AsyncOpenAI
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from aiogram.filters import Command
@@ -13,17 +13,20 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # например https://твой-сервис.onrender.com
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 10000))
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel(
-    model_name="gemini-2.0-flash",
-    system_instruction="Ты личный ассистент пользователя в Telegram. Помнишь историю разговора. Отвечай кратко и по делу. Общайся на языке пользователя."
+client = AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
 )
+
+MODEL = "meta-llama/llama-3.1-8b-instruct:free"
+
+SYSTEM_PROMPT = "Ты личный ассистент пользователя в Telegram. Помнишь историю разговора. Отвечай кратко и по делу. Общайся на языке пользователя."
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -46,15 +49,19 @@ async def handle_message(message: Message):
     await bot.send_chat_action(message.chat.id, "typing")
 
     history = await get_history(user_id)
-    gemini_history = []
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for msg in history:
-        role = "user" if msg["role"] == "user" else "model"
-        gemini_history.append({"role": role, "parts": [msg["content"]]})
+        role = "user" if msg["role"] == "user" else "assistant"
+        messages.append({"role": role, "content": msg["content"]})
+    messages.append({"role": "user", "content": user_text})
 
     try:
-        chat = model.start_chat(history=gemini_history)
-        response = await asyncio.to_thread(chat.send_message, user_text)
-        reply = response.text
+        response = await client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+        )
+        reply = response.choices[0].message.content
 
         history.append({"role": "user", "content": user_text})
         history.append({"role": "assistant", "content": reply})
