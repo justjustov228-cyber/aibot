@@ -24,7 +24,7 @@ client = AsyncOpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY"),
 )
 
-MODEL = "meta-llama/llama-3.1-8b-instruct:free"
+MODEL = "openrouter/free"
 
 SYSTEM_PROMPT = "Ты личный ассистент пользователя в Telegram. Помнишь историю разговора. Отвечай кратко и по делу. Общайся на языке пользователя."
 
