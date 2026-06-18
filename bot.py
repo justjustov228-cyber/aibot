@@ -383,8 +383,28 @@ async def handle_photo(message: Message):
 
         await message.answer(reply)
 
-    except Exception as e:
-        await message.answer(f"*раздражённо тушит сигарету*\n\nНе разглядела толком: {e}")
+ except Exception as e:
+    error_text = str(e).lower()
+
+    if any(x in error_text for x in [
+        "429",
+        "quota",
+        "balance",
+        "credit",
+        "rate limit",
+        "insufficient"
+    ]):
+        await message.answer(
+            "*встряхивает пустую пачку сигарет*\n\n"
+            "Похоже, лимит запросов временно исчерпан.\n\n"
+            "Владелец уже уведомлён и скоро всё исправит. "
+            "Попробуй снова через несколько минут."
+        )
+    else:
+        await message.answer(
+            "*щурится на фотографию*\n\n"
+            "Сейчас не могу нормально разобрать изображение. Попробуй ещё раз чуть позже."
+        )
 
 
 # ===================== ТЕКСТОВЫЕ СООБЩЕНИЯ (ЧАТ + ИГРЫ) =====================
