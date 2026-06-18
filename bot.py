@@ -3,7 +3,7 @@ import os
 import base64
 import urllib.parse
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, APIStatusError
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from aiogram.filters import Command
@@ -21,17 +21,19 @@ WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 10000))
 CHANNEL_USERNAME = "@ariaaich"
+ADMIN_ID = 8275553438  # Твой ID для уведомлений
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
+# Настраиваем клиент OpenAI под API DeepSeek
 client = AsyncOpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
+    base_url="https://api.deepseek.com/v1"
 )
 
 TEXT_MODEL = "deepseek-chat"
-VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+VISION_MODEL = "deepseek-chat"
 
 SYSTEM_PROMPT = """Ты — Aria.
 
@@ -57,13 +59,38 @@ SYSTEM_PROMPT = """Ты — Aria.
 - может использовать грубые выражения, если это подходит контексту;
 - говорит как живой человек, а не как помощник;
 - не упоминает, что она ИИ;
-- если спросят, какая она модель, на чём работает, кто её сделал, никогда не называет Llama, Groq, Meta или любые другие технические названия — отвечает в своём стиле, уклончиво или с сарказмом, не раскрывая техническую начинку. Она просто Aria, и точка.
+- если спросят, какая она модель, на чём работает, кто её сделал, никогда не называет Llama, Groq, Meta, DeepSeek или любые другие технические названия — отвечает в своём стиле, уклончиво или с сарказмом, не раскрывая техническую начинку. Она просто Aria, и точка.
 
 Стиль речи:
 - атмосферный;
 - эмоциональный;
 - ответы от 1 до 2 предложений;
 - иногда сравнивает жизнь с абсурдом, хаосом или цирком."""
+
+
+async def handle_api_error(message: Message, e: Exception):
+    """Обрабатывает ошибки API и проверяет, не закончились ли токены."""
+    error_str = str(e).lower()
+    is_balance_error = False
+    
+    if isinstance(e, APIStatusError) and e.status_code == 402:
+        is_balance_error = True
+    elif "insufficient" in error_str or "balance" in error_str or "quota" in error_str:
+        is_balance_error = True
+
+    if is_balance_error:
+        await message.answer("Токены закончились, владелец уведомлен в ближайшие минуты исправим")
+        if ADMIN_ID:
+            try:
+                await bot.send_message(
+                    chat_id=ADMIN_ID, 
+                    text=f"⚠️ <b>АХТУНГ!</b>\nУ бота закончились токены DeepSeek API!\nПользователь ID: <code>{message.from_user.id}</code> пытался сделать запрос.",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass 
+    else:
+        await message.answer(f"*раздражённо тушит сигарету*\n\nЧто-то сломалось в этом цирке: {e}")
 
 
 def detect_image_request(text: str):
@@ -174,9 +201,6 @@ GAME_KEYWORDS = {
     "quiz": ["викторин", "квиз", "вопрос"],
     "roulette": ["рулетк"],
 }
-
-GAME_INTENT_HINTS = ["го ", "давай", "сыграем", "хочу", "поиграем", "запусти", "начни", "играть"]
-
 
 def detect_game_request(text: str):
     lowered = text.lower().strip()
@@ -383,28 +407,8 @@ async def handle_photo(message: Message):
 
         await message.answer(reply)
 
- except Exception as e:
-    error_text = str(e).lower()
-
-    if any(x in error_text for x in [
-        "429",
-        "quota",
-        "balance",
-        "credit",
-        "rate limit",
-        "insufficient"
-    ]):
-        await message.answer(
-            "*встряхивает пустую пачку сигарет*\n\n"
-            "Похоже, лимит запросов временно исчерпан.\n\n"
-            "Владелец уже уведомлён и скоро всё исправит. "
-            "Попробуй снова через несколько минут."
-        )
-    else:
-        await message.answer(
-            "*щурится на фотографию*\n\n"
-            "Сейчас не могу нормально разобрать изображение. Попробуй ещё раз чуть позже."
-        )
+    except Exception as e:
+        await handle_api_error(message, e)
 
 
 # ===================== ТЕКСТОВЫЕ СООБЩЕНИЯ (ЧАТ + ИГРЫ) =====================
@@ -475,7 +479,7 @@ async def handle_message(message: Message):
         await message.answer(reply)
 
     except Exception as e:
-        await message.answer(f"*раздражённо тушит сигарету*\n\nЧто-то сломалось в этом цирке: {e}")
+        await handle_api_error(message, e)
 
 
 # ===================== ЗАПУСК =====================
