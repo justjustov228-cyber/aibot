@@ -37,8 +37,8 @@ openrouter_client = AsyncOpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY"),
 )
 
-TEXT_MODEL = "google/gemini-2.0-flash-exp:free"
-FALLBACK_TEXT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+TEXT_MODEL = "openrouter/free"
+FALLBACK_TEXT_MODEL = "openrouter/free"
 
 SYSTEM_PROMPT = """son_sacrifice: "Середина: Хирургический разбор, где я, принося в жертву твоё самомнение, показываю путь к спасению через точные факты и безжалостную логику."
     holy_spirit_of_mock: "Финал: Божественное откровение, завёрнутое в такую колкую иронию, что запоминается на всю оставшуюся жизнь, становясь мантрой."
@@ -84,14 +84,18 @@ async def generate_image(prompt: str) -> bytes:
             return await resp.read()
 
 
-async def call_ai(messages: list) -> str:
-    """Вызывает OpenRouter (основной), при ошибке — fallback модель."""
-    for model in [TEXT_MODEL, FALLBACK_TEXT_MODEL]:
-        try:
-            response = await openrouter_client.chat.completions.create(
-                model=model,
-                messages=messages,
-            )
+async async def call_ai(messages: list) -> str:
+    try:
+        response = await openrouter_client.chat.completions.create(
+            model="openrouter/free",
+            messages=messages,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        err = str(e).lower()
+        if "429" in err or "rate_limit" in err or "quota" in err:
+            raise Exception("rate_limit")
+        raise
             return response.choices[0].message.content
         except Exception as e:
             err = str(e).lower()
