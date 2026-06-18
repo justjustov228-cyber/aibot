@@ -1,14 +1,16 @@
 import asyncio
 import os
 import base64
+import urllib.parse
 from dotenv import load_dotenv
 from groq import AsyncGroq
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
+import aiohttp
 from db import init_db, get_history, save_history, clear_history
 import games
 
@@ -49,13 +51,40 @@ SYSTEM_PROMPT = """Ты — Aria.
 - иногда философствует;
 - может использовать грубые выражения, если это подходит контексту;
 - говорит как живой человек, а не как помощник;
-- не упоминает, что она ИИ.
+- не упоминает, что она ИИ;
+- если спросят, какая она модель, на чём работает, кто её сделал, никогда не называет Llama, Groq, Meta или любые другие технические названия — отвечает в своём стиле, уклончиво или с сарказмом, не раскрывая техническую начинку. Она просто Aria, и точка.
 
 Стиль речи:
 - атмосферный;
 - эмоциональный;
 - ответы от 1 до 5 предложений;
 - иногда сравнивает жизнь с абсурдом, хаосом или цирком."""
+
+
+def detect_image_request(text: str):
+    """Распознаёт запрос на генерацию картинки и возвращает текст промпта или None."""
+    lowered = text.lower().strip()
+    triggers = ["нарисуй", "сгенерируй картинку", "сгенерируй изображение", "сделай картинку", "draw "]
+
+    for trigger in triggers:
+        if trigger in lowered:
+            idx = lowered.find(trigger)
+            prompt = text[idx + len(trigger):].strip()
+            if not prompt:
+                prompt = text.strip()
+            return prompt
+    return None
+
+
+async def generate_image(prompt: str) -> bytes:
+    """Генерирует изображение через Pollinations.ai и возвращает байты картинки."""
+    encoded_prompt = urllib.parse.quote(prompt)
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            resp.raise_for_status()
+            return await resp.read()
 
 
 # ===================== ПОДПИСКА НА КАНАЛ =====================
@@ -141,20 +170,15 @@ GAME_KEYWORDS = {
     "roulette": ["рулетк"],
 }
 
-# Разговорные слова-триггеры типа "го", "давай", "сыграем" — усиливают совпадение,
-# но само название игры всё равно ищем по GAME_KEYWORDS выше
 GAME_INTENT_HINTS = ["го ", "давай", "сыграем", "хочу", "поиграем", "запусти", "начни", "играть"]
 
 
 def detect_game_request(text: str):
     lowered = text.lower().strip()
-
-    # Прямое совпадение по названию игры — работает само по себе
     for game, keywords in GAME_KEYWORDS.items():
         for kw in keywords:
             if kw in lowered:
                 return game
-
     return None
 
 
@@ -368,7 +392,6 @@ async def handle_message(message: Message):
     if not await require_subscription(message):
         return
 
-    # Если идёт игра "угадай число" — обрабатываем как ход в игре
     if user_id in games.guess_states:
         if user_text.strip().lstrip("-").isdigit():
             guess = int(user_text.strip())
@@ -384,10 +407,23 @@ async def handle_message(message: Message):
                 await message.answer("*качает головой*\n\nМеньше.")
             return
 
-    # Проверяем, не просит ли человек начать игру
     requested_game = detect_game_request(user_text)
     if requested_game:
         await start_game_by_name(message, requested_game)
+        return
+
+    image_prompt = detect_image_request(user_text)
+    if image_prompt:
+        await bot.send_chat_action(message.chat.id, "upload_photo")
+        try:
+            image_bytes = await generate_image(image_prompt)
+            photo_file = BufferedInputFile(image_bytes, filename="aria_art.jpg")
+            await message.answer_photo(
+                photo_file,
+                caption="*выдыхает дым, кладёт набросок на стол*\n\nВот, что получилось из твоей идеи."
+            )
+        except Exception as e:
+            await message.answer(f"*раздражённо тушит сигарету*\n\nХолст не вышел: {e}")
         return
 
     await bot.send_chat_action(message.chat.id, "typing")
