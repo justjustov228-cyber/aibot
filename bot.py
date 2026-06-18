@@ -26,9 +26,14 @@ ADMIN_ID = 8275553438  # Твой ID для уведомлений
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-# Настраиваем клиент OpenAI под API DeepSeek
+# Явно проверяем и забираем ключ DEEPSEEK_API_KEY
+deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+if not deepseek_key:
+    # Если вдруг переменной нет, попробуем взять из системной OPENAI_API_KEY (мало ли)
+    deepseek_key = os.getenv("OPENAI_API_KEY")
+
 client = AsyncOpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    api_key=deepseek_key,
     base_url="https://api.deepseek.com/v1"
 )
 
