@@ -26,7 +26,7 @@ dp = Dispatcher()
 client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
 
 TEXT_MODEL = "llama-3.3-70b-versatile"
-VISION_MODEL = "llama-3.2-90b-vision-preview"
+VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 SYSTEM_PROMPT = """Ты — Aria.
 
