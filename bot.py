@@ -3,7 +3,7 @@ import os
 import base64
 import urllib.parse
 from dotenv import load_dotenv
-from groq import AsyncGroq
+from openai import AsyncOpenAI
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from aiogram.filters import Command
@@ -25,9 +25,12 @@ CHANNEL_USERNAME = "@ariaaich"
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
+client = AsyncOpenAI(
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    base_url="https://api.deepseek.com"
+)
 
-TEXT_MODEL = "llama-3.3-70b-versatile"
+TEXT_MODEL = "deepseek-chat"
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 SYSTEM_PROMPT = """Ты — Aria.
