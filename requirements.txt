@@ -1,5 +1,4 @@
 aiogram==3.13.1
-groq
 openai
 python-dotenv
 aiosqlite
