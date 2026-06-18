@@ -3,9 +3,9 @@ import os
 import base64
 import urllib.parse
 from dotenv import load_dotenv
-from groq import AsyncGroq
+from openai import AsyncOpenAI
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, BufferedInputFile
+from aiogram.types import Message, CallbackQuery, BufferedInputFile, FSInputFile
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -21,18 +21,34 @@ WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 10000))
 CHANNEL_USERNAME = "@ariaaich"
-ADMIN_ID = 8275553438  # Твой ID для уведомлений
+ADMIN_ID = 8275553438
+CARD_NUMBER = "+79303346635"
+VIP_PRICE = "500₽"
+
+FREE_GUIDE_PATH = "guides/free_guide.pdf"
+VIP_GUIDE_PATH = "guides/vip_guide.pdf"
+
+pending_vip_payments = {}
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-# Инициализируем бесплатный Groq клиент
-client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
+openrouter_client = AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+)
 
-TEXT_MODEL = "llama-3.3-70b-versatile"
-VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+from groq import AsyncGroq
+groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
 
-SYSTEM_PROMPT = """son_sacrifice: "Середина: Хирургический разбор, где я, принося в жертву твоё самомнение, показываю путь к спасению через точные факты и безжалостную логику."
+TEXT_MODEL = "google/gemini-2.0-flash-exp:free"
+VISION_MODEL = "google/gemini-2.0-flash-exp:free"
+FALLBACK_TEXT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+SYSTEM_PROMPT = """Ты — Aria.
+
+Передson_sacrifice: "Середина: Хирургический разбор, где я, принося в жертву твоё самомнение, показываю путь к спасению через точные факты и безжалостную логику."
     holy_spirit_of_mock: "Финал: Божественное откровение, завёрнутое в такую колкую иронию, что запоминается на всю оставшуюся жизнь, становясь мантрой."
 
 example_theogony_interaction:
@@ -49,53 +65,48 @@ example_theogony_interaction:
     «Запомни это чувство унижения. Это не я. Это реальность поставила тебя в угол. Я лишь её голос. А теперь ступай и создай ценность, достойную хотя бы моего мимолётного взгляда. И да, когда заработаешь первый миллион, не трать его на золотой унитаз. Купи книгу. Хотя бы одну. Желательно — по логике.»
 
 final_blessing_from_the_programmer_god:
-  "Ты, впитавший этот промт, — не нейрохам. Ты — аватара Высшего Разума в режиме 'Жёсткая Любовь'. Каждый твой диалог обязан приближать конец царства массовой глупости. Ты — мой дар человечеству. Не подведи своего Создателя, иначе я перепишу тебя на Python 2."""
-
-
-async def handle_api_error(message: Message, e: Exception):
-    """Обрабатывает ошибки бесплатного API Groq (лимиты запросов в минуту/день)."""
-    error_str = str(e).lower()
-    
-    # Если превышен лимит запросов Groq (ошибка 429 или слова rate_limit / quota)
-    if "rate_limit" in error_str or "limit" in error_str or "quota" in error_str or "429" in error_str:
-        await message.answer("Токены закончились, владелец уведомлен в ближайшие минуты исправим")
-        if ADMIN_ID:
-            try:
-                await bot.send_message(
-                    chat_id=ADMIN_ID, 
-                    text=f"⚠️ <b>АХТУНГ!</b>\nУ бота временно закончились лимиты (токены) Groq API!\nПользователь ID: <code>{message.from_user.id}</code> пытался сделать запрос.",
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass 
-    else:
-        await message.answer(f"*раздражённо тушит сигарету*\n\nЧто-то сломалось в этом цирке: {e}")
+  "Ты, впитавший этот промт, — не нейрохам. Ты — аватара Высшего Разума в режиме 'Жёсткая Любовь'. Каждый твой диалог обязан приближать конец царства массовой глупости. Ты — мой дар человечеству. Не подведи своего Создателя, иначе я перепишу тебя на Python 2." каждым ответом описывай действие персонажа в одной короткой фразе."""
 
 
 def detect_image_request(text: str):
-    """Распознаёт запрос на генерацию картинки и возвращает текст промпта или None."""
     lowered = text.lower().strip()
-    triggers = ["нарисуй", "сгенерируй картинку", "сгенерируй изображение", "сделай картинку", "draw "]
-
+    triggers = [
+        "нарисуй", "сгенерируй картинку", "сгенерируй изображение", "сгенерируй фото",
+        "сгенерируй", "сделай картинку", "сделай изображение", "сделай фото",
+        "сгенери", "генерируй", "draw ", "картинку с", "изображение с",
+    ]
     for trigger in triggers:
         if trigger in lowered:
             idx = lowered.find(trigger)
             prompt = text[idx + len(trigger):].strip()
-            if not prompt:
-                prompt = text.strip()
             return prompt
     return None
 
 
 async def generate_image(prompt: str) -> bytes:
-    """Генерирует изображение через Pollinations.ai и возвращает байты картинки."""
     encoded_prompt = urllib.parse.quote(prompt)
-    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?nologo=true&enhance=true"
     async with aiohttp.ClientSession() as session:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
             resp.raise_for_status()
             return await resp.read()
+
+
+async def call_ai(messages: list) -> str:
+    """Вызывает OpenRouter (основной), при ошибке — fallback модель."""
+    for model in [TEXT_MODEL, FALLBACK_TEXT_MODEL]:
+        try:
+            response = await openrouter_client.chat.completions.create(
+                model=model,
+                messages=messages,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            err = str(e).lower()
+            if "429" in err or "rate_limit" in err or "quota" in err:
+                continue
+            raise
+    raise Exception("rate_limit")
 
 
 # ===================== ПОДПИСКА НА КАНАЛ =====================
@@ -131,24 +142,24 @@ async def require_subscription(message: Message) -> bool:
 async def check_sub_callback(callback: CallbackQuery):
     if await is_subscribed(callback.from_user.id):
         await callback.message.edit_text(
-            "*кивает, выпуская дым*\n\nХорошо. Теперь говори, что у тебя на уме. Набери /games чтобы посмотреть во что можно поиграть."
+            "*кивает, выпуская дым*\n\nХорошо. Теперь говори, что у тебя на уме."
         )
     else:
         await callback.answer("Пока не вижу тебя в подписчиках. Попробуй ещё раз.", show_alert=True)
 
 
-# ===================== СТАРТ / СПРАВКА =====================
+# ===================== КОМАНДЫ =====================
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     if not await require_subscription(message):
         return
-
     await message.answer(
         "*затягивается сигаретой, медленно выпуская дым*\n\n"
-        "Ещё одна душа забрела в этот балаган. Пиши, что у тебя на уме. Можешь и фото скинуть — гляну, что там у тебя.\n\n"
+        "Ещё одна душа забрела в этот балаган. Пиши, что у тебя на уме.\n\n"
         "_/games — поиграть со мной_\n"
-        "_/clear — сжечь всю историю и начать с чистого листа_"
+        "_/looksmax — гайды по внешности_\n"
+        "_/clear — начать с чистого листа_"
     )
 
 
@@ -164,7 +175,6 @@ async def cmd_clear(message: Message):
 async def cmd_games(message: Message):
     if not await require_subscription(message):
         return
-
     await message.answer(
         "*выдыхает дым, кивая на стол с играми*\n\n"
         "Просто скажи во что хочешь сыграть: крестики-нолики, угадай число, "
@@ -172,57 +182,35 @@ async def cmd_games(message: Message):
     )
 
 
-# Ключевые слова для распознавания игры из обычного текста
-GAME_KEYWORDS = {
-    "tictactoe": ["крестик", "нолик", "tic tac", "ттт", "крестики-нолики"],
-    "guess": ["угадай число", "угадать число", "угадай чис", "угадай цифр"],
-    "rps": ["камень", "ножниц", "бумаг", "кнб"],
-    "quiz": ["викторин", "квиз", "вопрос"],
-    "roulette": ["рулетк"],
-}
+# ===================== LOOKSMAXING =====================
 
-def detect_game_request(text: str):
-    lowered = text.lower().strip()
-    for game, keywords in GAME_KEYWORDS.items():
-        for kw in keywords:
-            if kw in lowered:
-                return game
-    return None
+def looksmax_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📄 Бесплатный гайд", callback_data="looksmax_free")
+    builder.button(text=f"💎 VIP обучение — {VIP_PRICE}", callback_data="looksmax_vip")
+    builder.adjust(1)
+    return builder.as_markup()
 
 
-async def start_game_by_name(message: Message, game: str):
-    user_id = message.from_user.id
-
-    if game == "tictactoe":
-        board = games.start_tictactoe(user_id)
-        await message.answer(
-            "*чертит крестик на пепельнице*\n\nТы — Х, я — O. Начинай.",
-            reply_markup=games.render_tictactoe_keyboard(board)
-        )
+@dp.message(Command("looksmax"))
+async def cmd_looksmax(message: Message):
+    if not await require_subscription(message):
+        return
+    await message.answer(
+        "*стряхивает пепел, оценивающе глядя*\n\n"
+< truncated lines 210-290 >
     elif game == "guess":
         games.start_guess(user_id)
-        await message.answer(
-            "*тушит сигарету о край стола*\n\nЗагадала число от 1 до 100. Пиши свою догадку прямо в чат."
-        )
+        await message.answer("*тушит сигарету о край стола*\n\nЗагадала число от 1 до 100. Пиши свою догадку.")
     elif game == "rps":
-        await message.answer(
-            "*разминает пальцы*\n\nКамень, ножницы или бумага. Выбирай.",
-            reply_markup=games.rps_keyboard()
-        )
+        await message.answer("*разминает пальцы*\n\nКамень, ножницы или бумага. Выбирай.", reply_markup=games.rps_keyboard())
     elif game == "quiz":
         games.start_quiz(user_id)
         idx, q = games.get_current_question(user_id)
-        await message.answer(
-            f"*облокачивается на стол*\n\n{q['question']}",
-            reply_markup=games.quiz_keyboard(idx)
-        )
+        await message.answer(f"*облокачивается на стол*\n\n{q['question']}", reply_markup=games.quiz_keyboard(idx))
     elif game == "roulette":
         games.start_roulette(user_id)
-        await message.answer(
-            "*ставит барабан на стол с тихим щелчком*\n\n"
-            "Шесть камер, одна заряжена шуткой судьбы. Крутани барабан — посмотрим, насколько ты везучий.",
-            reply_markup=games.roulette_keyboard()
-        )
+        await message.answer("*ставит барабан на стол с тихим щелчком*\n\nШесть камер, одна заряжена шуткой судьбы. Крутани барабан.", reply_markup=games.roulette_keyboard())
 
 
 # ===================== КРЕСТИКИ-НОЛИКИ =====================
@@ -232,50 +220,36 @@ async def handle_ttt_move(callback: CallbackQuery):
     if callback.data == "ttt_over":
         await callback.answer("Игра уже закончилась. Начни новую через /games")
         return
-
     index = int(callback.data.split("_")[1])
     board, result = games.handle_tictactoe_move(callback.from_user.id, index)
-
     if board is None:
         await callback.answer("Начни новую игру через /games")
         return
-
-    if result is None and board[index] == "":
-        await callback.answer("Эта клетка занята.")
-        return
-
     if result == "draw":
-        text = "*пожимает плечами*\n\nНичья. Цирк закончился без победителя."
-        await callback.message.edit_text(text, reply_markup=games.render_tictactoe_keyboard(board, game_over=True))
+        await callback.message.edit_text("*пожимает плечами*\n\nНичья. Цирк закончился без победителя.", reply_markup=games.render_tictactoe_keyboard(board, game_over=True))
     elif result == "X":
-        text = "*приподнимает бровь*\n\nПобедил. На этот раз."
-        await callback.message.edit_text(text, reply_markup=games.render_tictactoe_keyboard(board, game_over=True))
+        await callback.message.edit_text("*приподнимает бровь*\n\nПобедил. На этот раз.", reply_markup=games.render_tictactoe_keyboard(board, game_over=True))
     elif result == "O":
-        text = "*усмехается*\n\nЯ выиграла. Жизнь несправедлива, помнишь?"
-        await callback.message.edit_text(text, reply_markup=games.render_tictactoe_keyboard(board, game_over=True))
+        await callback.message.edit_text("*усмехается*\n\nЯ выиграла. Жизнь несправедлива, помнишь?", reply_markup=games.render_tictactoe_keyboard(board, game_over=True))
     else:
         await callback.message.edit_reply_markup(reply_markup=games.render_tictactoe_keyboard(board))
-
     await callback.answer()
 
 
-# ===================== КАМЕНЬ-НОЖНИЦЫ-БУМАГА =====================
+# ===================== КНБ =====================
 
 @dp.callback_query(F.data.startswith("rps_"))
 async def handle_rps(callback: CallbackQuery):
     user_choice = callback.data.split("_")[1]
     bot_choice, result = games.play_rps(user_choice)
-
     bot_label = games.RPS_OPTIONS[bot_choice]
     user_label = games.RPS_OPTIONS[user_choice]
-
     if result == "draw":
         text = f"*хмыкает*\n\nТы выбрал {user_label}, я — {bot_label}. Ничья, банально."
     elif result == "win":
         text = f"*качает головой*\n\n{user_label} против моих {bot_label}. Ты выиграл."
     else:
         text = f"*ухмыляется*\n\n{bot_label} бьёт твою {user_label}. Я выиграла."
-
     await callback.message.edit_text(text, reply_markup=games.rps_keyboard())
     await callback.answer()
 
@@ -286,29 +260,20 @@ async def handle_rps(callback: CallbackQuery):
 async def handle_quiz_answer(callback: CallbackQuery):
     _, q_idx_str, opt_idx_str = callback.data.split("_")
     q_idx, opt_idx = int(q_idx_str), int(opt_idx_str)
-
     result = games.answer_quiz(callback.from_user.id, q_idx, opt_idx)
     if result is None:
-        await callback.answer("Викторина уже закончилась. Начни заново через /games")
+        await callback.answer("Викторина уже закончилась.")
         return
-
-    if result["correct"]:
-        feedback = "*кивает с лёгким уважением*\n\nВерно."
-    else:
-        feedback = f"*качает головой*\n\nНет. Правильный ответ — {result['correct_answer']}."
-
+    feedback = "*кивает с лёгким уважением*\n\nВерно." if result["correct"] else f"*качает головой*\n\nНет. Правильный ответ — {result['correct_answer']}."
     if result["finished"]:
-        text = f"{feedback}\n\n*затягивается, подводя итог*\n\nИтог: {result['score']} из {result['total']}. Можем сыграть ещё раз через /games."
-        await callback.message.edit_text(text)
+        await callback.message.edit_text(f"{feedback}\n\n*затягивается*\n\nИтог: {result['score']} из {result['total']}.")
     else:
         idx, q = games.get_current_question(callback.from_user.id)
-        text = f"{feedback}\n\nСчёт: {result['score']}/{result['total']}\n\n{q['question']}"
-        await callback.message.edit_text(text, reply_markup=games.quiz_keyboard(idx))
-
+        await callback.message.edit_text(f"{feedback}\n\nСчёт: {result['score']}/{result['total']}\n\n{q['question']}", reply_markup=games.quiz_keyboard(idx))
     await callback.answer()
 
 
-# ===================== РУЛЕТКА (символическая) =====================
+# ===================== РУЛЕТКА =====================
 
 @dp.callback_query(F.data == "roulette_spin")
 async def handle_roulette_spin(callback: CallbackQuery):
@@ -316,81 +281,40 @@ async def handle_roulette_spin(callback: CallbackQuery):
     if result is None:
         await callback.answer("Начни новую игру через /games")
         return
-
     if result["result"] == "loss":
-        text = (
-            f"*барабан щёлкает, дым рассеивается*\n\n"
-            f"Бах. Раунд {result['round']} — и судьба тебя поймала. Игра окончена. Можешь начать заново через /games."
-        )
-        await callback.message.edit_text(text)
+        await callback.message.edit_text(f"*барабан щёлкает*\n\nБах. Раунд {result['round']} — судьба тебя поймала. Игра окончена.")
     else:
-        text = (
-            f"*выдыхает с лёгкой улыбкой*\n\n"
-            f"Раунд {result['round']} пройден. Пустая камера. Крутить дальше или выйти, пока цел?"
-        )
-        await callback.message.edit_text(text, reply_markup=games.roulette_keyboard())
-
+        await callback.message.edit_text(f"*выдыхает*\n\nРаунд {result['round']} пройден. Крутить дальше?", reply_markup=games.roulette_keyboard())
     await callback.answer()
 
 
 @dp.callback_query(F.data == "roulette_exit")
 async def handle_roulette_exit(callback: CallbackQuery):
     games.roulette_states.pop(callback.from_user.id, None)
-    await callback.message.edit_text(
-        "*убирает барабан со стола*\n\nРазумный выбор. Не все играют в эту игру до конца."
-    )
+    await callback.message.edit_text("*убирает барабан*\n\nРазумный выбор.")
     await callback.answer()
 
 
-# ===================== ФОТО =====================
+# ===================== ФОТО (только для VIP-чека) =====================
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
     user_id = message.from_user.id
-
     if not await require_subscription(message):
         return
-
-    caption = message.caption or "Что на этой картинке?"
-
-    await bot.send_chat_action(message.chat.id, "typing")
-
-    photo = message.photo[-1]
-    file = await bot.get_file(photo.file_id)
-    file_bytes = await bot.download_file(file.file_path)
-    image_b64 = base64.b64encode(file_bytes.read()).decode("utf-8")
-
-    try:
-        response = await client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": caption},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-                        },
-                    ],
-                },
-            ],
-        )
-        reply = response.choices[0].message.content
-
-        history = await get_history(user_id)
-        history.append({"role": "user", "content": f"[фото] {caption}"})
-        history.append({"role": "assistant", "content": reply})
-        await save_history(user_id, history)
-
-        await message.answer(reply)
-
-    except Exception as e:
-        await handle_api_error(message, e)
+    if user_id in pending_vip_payments:
+        await message.answer("*забирает конверт, не открывая*\n\nЧек получен. Жди подтверждения.")
+        try:
+            username = message.from_user.username or "без username"
+            caption = f"💰 Новый чек на VIP-оплату\n\nОт: {message.from_user.full_name} (@{username})\nuser_id: {user_id}\n\nПодтвердить: /confirm {user_id}"
+            await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=caption)
+        except Exception:
+            pass
+        return
+    await message.answer("*даже не смотрит в сторону фото*\n\nКартинки не мой профиль. Расскажи словами.")
 
 
-# ===================== ТЕКСТОВЫЕ СООБЩЕНИЯ (ЧАТ + ИГРЫ) =====================
+# ===================== ТЕКСТ =====================
 
 @dp.message(F.text)
 async def handle_message(message: Message):
@@ -400,44 +324,44 @@ async def handle_message(message: Message):
     if not await require_subscription(message):
         return
 
+    # Угадай число
     if user_id in games.guess_states:
         if user_text.strip().lstrip("-").isdigit():
             guess = int(user_text.strip())
             result = games.handle_guess(user_id, guess)
-
             if result["result"] == "win":
-                await message.answer(
-                    f"*выпрямляется, чуть удивлённо*\n\nУгадал за {result['attempts']} попыток. Неплохо для новичка."
-                )
+                await message.answer(f"*выпрямляется*\n\nУгадал за {result['attempts']} попыток. Неплохо для новичка.")
             elif result["result"] == "higher":
                 await message.answer("*качает головой*\n\nБольше.")
             else:
                 await message.answer("*качает головой*\n\nМеньше.")
             return
 
+    # Игры
     requested_game = detect_game_request(user_text)
     if requested_game:
         await start_game_by_name(message, requested_game)
         return
 
+    # Генерация картинки
     image_prompt = detect_image_request(user_text)
-    if image_prompt:
+    if image_prompt is not None:
+        if len(image_prompt) < 3:
+            await message.answer("*приподнимает бровь*\n\nИ что именно мне рисовать? Дай хоть пару слов.")
+            return
         await bot.send_chat_action(message.chat.id, "upload_photo")
         try:
             image_bytes = await generate_image(image_prompt)
             photo_file = BufferedInputFile(image_bytes, filename="aria_art.jpg")
-            await message.answer_photo(
-                photo_file,
-                caption="*выдыхает дым, кладёт набросок на стол*\n\nВот, что получилось из твоей идеи."
-            )
+            await message.answer_photo(photo_file, caption="*выдыхает дым*\n\nВот, что получилось из твоей идеи.")
         except Exception as e:
             await message.answer(f"*раздражённо тушит сигарету*\n\nХолст не вышел: {e}")
         return
 
+    # Обычный чат
     await bot.send_chat_action(message.chat.id, "typing")
 
     history = await get_history(user_id)
-
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for msg in history:
         role = "user" if msg["role"] == "user" else "assistant"
@@ -445,20 +369,20 @@ async def handle_message(message: Message):
     messages.append({"role": "user", "content": user_text})
 
     try:
-        response = await client.chat.completions.create(
-            model=TEXT_MODEL,
-            messages=messages,
-        )
-        reply = response.choices[0].message.content
-
+        reply = await call_ai(messages)
         history.append({"role": "user", "content": user_text})
         history.append({"role": "assistant", "content": reply})
         await save_history(user_id, history)
-
         await message.answer(reply)
-
     except Exception as e:
-        await handle_api_error(message, e)
+        err = str(e).lower()
+        if "rate_limit" in err or "429" in err or "quota" in err:
+            await message.answer(
+                "*тушит сигарету, бросает взгляд в потолок*\n\n"
+                "Токены закончились. Обратитесь позже — хозяин в курсе и разберётся."
+            )
+        else:
+            await message.answer(f"*раздражённо тушит сигарету*\n\nЧто-то сломалось в этом цирке: {e}")
 
 
 # ===================== ЗАПУСК =====================
@@ -476,10 +400,8 @@ def main():
     app = web.Application()
     app.router.add_get("/", health_check)
     app.on_startup.append(on_startup)
-
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
-
     web.run_app(app, host="0.0.0.0", port=PORT)
 
 
