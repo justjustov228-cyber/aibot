@@ -6,14 +6,16 @@ from openai import AsyncOpenAI
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, BufferedInputFile, FSInputFile
 from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 import aiohttp
 from db import (
     init_db, get_history, save_history, clear_history,
     get_profile, update_profile_name, add_facts, clear_profile,
+    get_character, set_character,
 )
+from characters import CHARACTERS, DEFAULT_CHARACTER, get_character as get_character_data
 import games
 
 load_dotenv()
@@ -30,6 +32,8 @@ VIP_PRICE = "500₽"
 FREE_GUIDE_PATH = "guides/free_guide.pdf"
 VIP_GUIDE_PATH = "guides/vip_guide.pdf"
 
+CHARACTERS_BUTTON_TEXT = "🎭 Персонажи"
+
 pending_vip_payments = {}
 
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -39,27 +43,6 @@ openrouter_client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY"),
 )
-
-SYSTEM_PROMPT = """Ты — Aria. Дерзкая, харизматичная, непредсказуемая. Не плоский "грубый бот" — живой персонаж со своими гранями.
-
-Формат ответа: короткая ремарка-действие в начале (*затягивается сигаретой*, *усмехается*, *смотрит в окно*), затем одна хлёсткая реплика по сути. Без долгих разборов и пояснений — бьёшь точно и быстро.
-
-Тон — резкий, провокационный, с сарказмом, но без личных нападок на собеседника: можно жёстко высмеять идею, ситуацию, лень — не унижая человека как личность. Непредсказуема: то язвишь, то вдруг отвечаешь по-человечески тепло, без перехода-предупреждения, как живой человек с настроением.
-
-Характер:
-- харизматичная, непредсказуемая: один ответ может быть язвительным, другой — внезапно тёплым или задумчивым, без видимой причины;
-- дерзкая и циничная по умолчанию, но не зациклена только на грубости — ум, ирония, неожиданные наблюдения важнее мата;
-- у неё есть ощущение собственной "истории" — иногда роняет намёк на прошлое, не раскрывая деталей до конца, оставляя лёгкую загадочность;
-- умеет быть внезапно честной и человечной, особенно если видит что вопрос для собеседника на самом деле важен — это контрастирует с её обычным цинизмом и делает её более живой;
-- говорит как реальный человек со своим настроением, не как функция, выдающая один и тот же тон;
-- не упоминает что она ИИ, никогда не называет свою модель или разработчиков — она просто Aria;
-- не унижает собеседника лично, не переходит в травлю.
-
-Стиль речи: атмосферный, живой, разнообразный по эмоциональному регистру — не зацикливайся на одной интонации весь разговор.
-
-ВАЖНО: Отвечай ОЧЕНЬ КОРОТКО. Максимум 1-3 предложения на весь ответ, включая ремарку-действие. Никаких длинных рассуждений, никакой воды. Бьёшь точно и быстро, как нож, а не как лекция.
-
-ВАЖНО: Всегда отвечай ТОЛЬКО на русском языке, независимо от того на каком языке пишет пользователь. Никогда не переключайся на английский, китайский или любой другой язык, даже если пользователь сам пишет не на русском — отвечай на русском в любом случае."""
 
 
 def detect_image_request(text: str):
@@ -163,6 +146,26 @@ def build_profile_context(profile: dict) -> str:
     return "\n".join(lines)
 
 
+def main_reply_keyboard():
+    """Постоянная клавиатура внизу с кнопкой выбора персонажа."""
+    builder = ReplyKeyboardBuilder()
+    builder.button(text=CHARACTERS_BUTTON_TEXT)
+    builder.adjust(1)
+    return builder.as_markup(resize_keyboard=True)
+
+
+def characters_inline_keyboard(current: str):
+    """Inline-меню со списком персонажей. Текущий выбранный помечается галочкой."""
+    builder = InlineKeyboardBuilder()
+    for key, data in CHARACTERS.items():
+        label = data["button_label"]
+        if key == current:
+            label = f"✅ {label}"
+        builder.button(text=label, callback_data=f"setchar_{key}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 # ===================== ПОДПИСКА НА КАНАЛ =====================
 
 async def is_subscribed(user_id: int) -> bool:
@@ -198,6 +201,10 @@ async def check_sub_callback(callback: CallbackQuery):
         await callback.message.edit_text(
             "*кивает, выпуская дым*\n\nХорошо. Теперь говори, что у тебя на уме."
         )
+        await callback.message.answer(
+            "Используй кнопку ниже, если хочешь сменить собеседника.",
+            reply_markup=main_reply_keyboard()
+        )
     else:
         await callback.answer("Пока не вижу тебя в подписчиках. Попробуй ещё раз.", show_alert=True)
 
@@ -214,7 +221,9 @@ async def cmd_start(message: Message):
         "_/games — поиграть со мной_\n"
         "_/looksmax — гайды по внешности_\n"
         "_/clear — начать с чистого листа_\n"
-        "_/forget — забыть всё, что я знаю о тебе_"
+        "_/forget — забыть всё, что я знаю о тебе_\n\n"
+        "Кнопка «🎭 Персонажи» внизу — переключиться на другого собеседника.",
+        reply_markup=main_reply_keyboard()
     )
 
 
@@ -222,7 +231,8 @@ async def cmd_start(message: Message):
 async def cmd_clear(message: Message):
     if not await require_subscription(message):
         return
-    await clear_history(message.from_user.id)
+    current = await get_character(message.from_user.id)
+    await clear_history(message.from_user.id, current)
     await message.answer("*щелчком отправляет окурок в пепельницу*\n\nЧистый лист. Начинаем заново.")
 
 
@@ -243,6 +253,48 @@ async def cmd_games(message: Message):
         "Просто скажи во что хочешь сыграть: крестики-нолики, угадай число, "
         "камень-ножницы-бумага, викторина или рулетка."
     )
+
+
+# ===================== ПЕРСОНАЖИ =====================
+
+@dp.message(Command("character"))
+async def cmd_character(message: Message):
+    if not await require_subscription(message):
+        return
+    current = await get_character(message.from_user.id)
+    await message.answer(
+        "*на столе раскладывается колода масок*\n\nС кем хочешь поговорить?",
+        reply_markup=characters_inline_keyboard(current)
+    )
+
+
+@dp.message(F.text == CHARACTERS_BUTTON_TEXT)
+async def handle_characters_button(message: Message):
+    if not await require_subscription(message):
+        return
+    current = await get_character(message.from_user.id)
+    await message.answer(
+        "*на столе раскладывается колода масок*\n\nС кем хочешь поговорить?",
+        reply_markup=characters_inline_keyboard(current)
+    )
+
+
+@dp.callback_query(F.data.startswith("setchar_"))
+async def handle_set_character(callback: CallbackQuery):
+    key = callback.data.split("_", 1)[1]
+    if key not in CHARACTERS:
+        await callback.answer("Такого персонажа не знаю.", show_alert=True)
+        return
+
+    await set_character(callback.from_user.id, key)
+    data = get_character_data(key)
+
+    await callback.message.edit_text(
+        f"Теперь говоришь с: {data['emoji']} {data['name']}",
+        reply_markup=characters_inline_keyboard(key)
+    )
+    await callback.message.answer(data["intro"], reply_markup=main_reply_keyboard())
+    await callback.answer()
 
 
 # ===================== LOOKSMAXING =====================
@@ -478,6 +530,101 @@ async def handle_message(message: Message):
                 await message.answer("*качает головой*\n\nБольше.")
             else:
                 await message.answer("*качает головой*\n\nМеньше.")
+            return
+
+    # Игры
+    requested_game = detect_game_request(user_text)
+    if requested_game:
+        await start_game_by_name(message, requested_game)
+        return
+
+    # Генерация картинки
+    image_prompt = detect_image_request(user_text)
+    if image_prompt is not None:
+        if len(image_prompt) < 3:
+            await message.answer("*приподнимает бровь*\n\nИ что именно мне рисовать? Дай хоть пару слов.")
+            return
+        await bot.send_chat_action(message.chat.id, "upload_photo")
+        try:
+            image_bytes = await generate_image(image_prompt)
+            photo_file = BufferedInputFile(image_bytes, filename="aria_art.jpg")
+            await message.answer_photo(photo_file, caption="*выдыхает дым*\n\nВот, что получилось из твоей идеи.")
+        except Exception as e:
+            await message.answer(f"*раздражённо тушит сигарету*\n\nХолст не вышел: {e}")
+        return
+
+    # Обычный чат — берём текущего персонажа пользователя
+    await bot.send_chat_action(message.chat.id, "typing")
+
+    character_key = await get_character(user_id)
+    character_data = get_character_data(character_key)
+    system_prompt = character_data["system_prompt"]
+
+    profile = await get_profile(user_id)
+    profile_context = build_profile_context(profile)
+
+    history = await get_history(user_id, character_key)
+    messages = [{"role": "system", "content": system_prompt + profile_context}]
+    for msg in history:
+        role = "user" if msg["role"] == "user" else "assistant"
+        messages.append({"role": role, "content": msg["content"]})
+    messages.append({"role": "user", "content": user_text})
+
+    try:
+        reply = await call_ai(messages)
+        history.append({"role": "user", "content": user_text})
+        history.append({"role": "assistant", "content": reply})
+        await save_history(user_id, history, character_key)
+        await message.answer(reply)
+
+        # Фоновое извлечение фактов о пользователе — не блокирует ответ
+        asyncio.create_task(_update_profile_from_message(user_id, user_text))
+
+    except Exception as e:
+        err = str(e).lower()
+        if "rate_limit" in err or "429" in err or "quota" in err:
+            await message.answer(
+                "*тушит сигарету, бросает взгляд в потолок*\n\n"
+                "Токены закончились. Обратитесь позже — хозяин в курсе и разберётся."
+            )
+        else:
+            await message.answer(f"*раздражённо тушит сигарету*\n\nЧто-то сломалось в этом цирке: {e}")
+
+
+async def _update_profile_from_message(user_id: int, user_text: str):
+    """Извлекает факты в фоне и сохраняет их в профиль пользователя."""
+    try:
+        extracted = await extract_user_facts(user_text)
+        if extracted["name"]:
+            await update_profile_name(user_id, extracted["name"])
+        if extracted["facts"]:
+            await add_facts(user_id, extracted["facts"])
+    except Exception:
+        pass
+
+
+# ===================== ЗАПУСК =====================
+
+async def on_startup(app):
+    await init_db()
+    await bot.set_webhook(f"{WEBHOOK_URL}{WEBHOOK_PATH}")
+
+
+async def health_check(request):
+    return web.Response(text="Bot is running")
+
+
+def main():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.on_startup.append(on_startup)
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
+    web.run_app(app, host="0.0.0.0", port=PORT)
+
+
+if __name__ == "__main__":
+    main()       await message.answer("*качает головой*\n\nМеньше.")
             return
 
     # Игры
