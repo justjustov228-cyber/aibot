@@ -1,21 +1,34 @@
 import asyncio
 import os
+import time
 import urllib.parse
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, BufferedInputFile, FSInputFile
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import aiohttp
 from db import (
     init_db, get_history, save_history, clear_history,
     get_profile, update_profile_name, add_facts, clear_profile,
     get_character, set_character,
+    touch_streak, get_users_missed_yesterday,
+    set_referrer_if_new, get_referral_count,
+    get_custom_character_limit, get_custom_characters, get_custom_character_count,
+    add_custom_character, get_custom_character_by_slug, delete_custom_character,
 )
 from characters import CHARACTERS, DEFAULT_CHARACTER, get_character as get_character_data
+from custom_characters import (
+    generate_known_character, generate_custom_character, slugify,
+)
+import voice
 import games
 
 load_dotenv()
@@ -28,21 +41,73 @@ CHANNEL_USERNAME = "@ariaaich"
 ADMIN_ID = 8275553438
 CARD_NUMBER = "+79303346635"
 VIP_PRICE = "500₽"
+BOT_USERNAME = os.getenv("BOT_USERNAME", "")  # без @, например "AriaAiBot" — для реф-ссылок
 
 FREE_GUIDE_PATH = "guides/free_guide.pdf"
 VIP_GUIDE_PATH = "guides/vip_guide.pdf"
 
 CHARACTERS_BUTTON_TEXT = "🎭 Персонажи"
 
+# ===================== АНТИ-СПАМ / РЕЙТ-ЛИМИТ =====================
+# Простое ограничение в памяти процесса: не более RATE_LIMIT_COUNT сообщений
+# за RATE_LIMIT_WINDOW секунд на пользователя. Этого достаточно для одного
+# инстанса на Render free tier (WEB_CONCURRENCY=1).
+RATE_LIMIT_WINDOW = 10  # секунд
+RATE_LIMIT_COUNT = 5    # сообщений за окно
+MIN_GAP_SECONDS = 1.2   # минимальный промежуток между двумя последовательными сообщениями
+
+user_message_timestamps = {}  # user_id -> [timestamps]
+user_last_message_time = {}   # user_id -> timestamp последнего сообщения
+
 pending_vip_payments = {}
 
 bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher()
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
 openrouter_client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY"),
 )
+
+
+# ===================== FSM ДЛЯ СОЗДАНИЯ ПЕРСОНАЖА =====================
+
+class CreateCharacterStates(StatesGroup):
+    choosing_type = State()
+    waiting_known_name = State()
+    waiting_custom_description = State()
+
+
+# ===================== АНТИ-СПАМ =====================
+
+def is_rate_limited(user_id: int) -> bool:
+    """Возвращает True, если пользователь сейчас должен быть притормозен."""
+    now = time.time()
+
+    last_time = user_last_message_time.get(user_id, 0)
+    if now - last_time < MIN_GAP_SECONDS:
+        return True
+
+    timestamps = user_message_timestamps.get(user_id, [])
+    timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
+    timestamps.append(now)
+    user_message_timestamps[user_id] = timestamps
+    user_last_message_time[user_id] = now
+
+    return len(timestamps) > RATE_LIMIT_COUNT
+
+
+RATE_LIMIT_REPLIES = [
+    "*приподнимает бровь*\n\nНе спеши так. Дай мне хоть слово сказать.",
+    "*выдыхает дым*\n\nПридержи коней. Секунду.",
+    "*смотрит устало*\n\nОдно сообщение за раз, ладно?",
+]
+
+
+async def handle_rate_limit(message: Message):
+    import random
+    await message.answer(random.choice(RATE_LIMIT_REPLIES))
 
 
 def detect_image_request(text: str):
@@ -154,16 +219,46 @@ def main_reply_keyboard():
     return builder.as_markup(resize_keyboard=True)
 
 
-def characters_inline_keyboard(current: str):
-    """Inline-меню со списком персонажей. Текущий выбранный помечается галочкой."""
+async def characters_inline_keyboard(user_id: int, current: str):
+    """Inline-меню: встроенные персонажи + кастомные персонажи этого пользователя."""
     builder = InlineKeyboardBuilder()
     for key, data in CHARACTERS.items():
         label = data["button_label"]
         if key == current:
             label = f"✅ {label}"
         builder.button(text=label, callback_data=f"setchar_{key}")
+
+    custom_list = await get_custom_characters(user_id)
+    for c in custom_list:
+        custom_key = f"custom:{c['slug']}"
+        label = f"{c['emoji']} {c['name']}"
+        if current == custom_key:
+            label = f"✅ {label}"
+        builder.button(text=label, callback_data=f"setcustom_{c['slug']}")
+
+    builder.button(text="➕ Создать своего персонажа", callback_data="create_character_start")
     builder.adjust(1)
     return builder.as_markup()
+
+
+async def resolve_character(user_id: int, character_key: str) -> dict:
+    """
+    Возвращает данные персонажа (встроенного или кастомного) по ключу из профиля.
+    Кастомные хранятся как 'custom:<slug>'.
+    """
+    if character_key.startswith("custom:"):
+        slug = character_key.split(":", 1)[1]
+        custom = await get_custom_character_by_slug(user_id, slug)
+        if custom:
+            return {
+                "name": custom["name"],
+                "emoji": custom["emoji"],
+                "system_prompt": custom["system_prompt"],
+                "intro": custom["intro"],
+            }
+        # кастомный персонаж был удалён — откатываемся на дефолт
+        return get_character_data(DEFAULT_CHARACTER)
+    return get_character_data(character_key)
 
 
 # ===================== ПОДПИСКА НА КАНАЛ =====================
@@ -212,14 +307,38 @@ async def check_sub_callback(callback: CallbackQuery):
 # ===================== КОМАНДЫ =====================
 
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, command: CommandObject):
+    user_id = message.from_user.id
+
+    # Обработка реферальной ссылки: /start ref_<id>
+    args = command.args
+    if args and args.startswith("ref_"):
+        try:
+            referrer_id = int(args[4:])
+            was_new = await set_referrer_if_new(user_id, referrer_id)
+            if was_new:
+                try:
+                    new_count = await get_referral_count(referrer_id)
+                    await bot.send_message(
+                        referrer_id,
+                        f"*довольно усмехается*\n\nПо твоей ссылке зашёл новый человек. "
+                        f"Рефералов теперь: {new_count}. Открыт ещё один слот для своего персонажа — /createcharacter."
+                    )
+                except Exception:
+                    pass
+        except ValueError:
+            pass
+
     if not await require_subscription(message):
         return
+
     await message.answer(
         "*затягивается сигаретой, медленно выпуская дым*\n\n"
         "Ещё одна душа забрела в этот балаган. Пиши, что у тебя на уме.\n\n"
         "_/games — поиграть со мной_\n"
         "_/looksmax — гайды по внешности_\n"
+        "_/createcharacter — создать своего персонажа_\n"
+        "_/referral — твоя реферальная ссылка_\n"
         "_/clear — начать с чистого листа_\n"
         "_/forget — забыть всё, что я знаю о тебе_\n\n"
         "Кнопка «🎭 Персонажи» внизу — переключиться на другого собеседника.",
@@ -255,6 +374,189 @@ async def cmd_games(message: Message):
     )
 
 
+# ===================== РЕФЕРАЛЬНАЯ ПРОГРАММА =====================
+
+@dp.message(Command("referral"))
+async def cmd_referral(message: Message):
+    if not await require_subscription(message):
+        return
+
+    user_id = message.from_user.id
+    count = await get_referral_count(user_id)
+
+    if BOT_USERNAME:
+        link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+        link_line = f"Твоя ссылка:\n`{link}`"
+    else:
+        link_line = f"Твоя ссылка:\n`/start ref_{user_id}` (попроси друга открыть бота и ввести эту команду)"
+
+    await message.answer(
+        f"*кладёт на стол колоду карт*\n\n"
+        f"Приведи друга — получи слот для своего персонажа.\n\n"
+        f"{link_line}\n\n"
+        f"Рефералов сейчас: {count}. Доступно слотов для кастомных персонажей: {count}.",
+        parse_mode="Markdown"
+    )
+
+
+# ===================== СОЗДАНИЕ КАСТОМНОГО ПЕРСОНАЖА =====================
+
+def create_character_type_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🎬 Известная личность/персонаж", callback_data="createchar_known")
+    builder.button(text="✏️ Придумать своего", callback_data="createchar_custom")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+@dp.message(Command("createcharacter"))
+async def cmd_create_character(message: Message, state: FSMContext):
+    if not await require_subscription(message):
+        return
+
+    user_id = message.from_user.id
+    limit = await get_custom_character_limit(user_id)
+    current_count = await get_custom_character_count(user_id)
+
+    if limit == 0:
+        await message.answer(
+            "*качает головой*\n\n"
+            "Создание своего персонажа открывается за рефералов. Приведи друга — /referral."
+        )
+        return
+
+    if current_count >= limit:
+        await message.answer(
+            f"*разводит руками*\n\n"
+            f"Слоты закончились: {current_count}/{limit}. Приведи ещё одного друга — /referral."
+        )
+        return
+
+    await message.answer(
+        f"*раскладывает чистый холст*\n\n"
+        f"Слотов доступно: {current_count}/{limit}. Кого создаём?",
+        reply_markup=create_character_type_keyboard()
+    )
+    await state.set_state(CreateCharacterStates.choosing_type)
+
+
+@dp.callback_query(F.data == "create_character_start")
+async def handle_create_character_button(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    user_id = callback.from_user.id
+    limit = await get_custom_character_limit(user_id)
+    current_count = await get_custom_character_count(user_id)
+
+    if limit == 0:
+        await callback.message.answer(
+            "*качает головой*\n\nСоздание своего персонажа открывается за рефералов. Приведи друга — /referral."
+        )
+        return
+
+    if current_count >= limit:
+        await callback.message.answer(
+            f"*разводит руками*\n\nСлоты закончились: {current_count}/{limit}. Приведи ещё одного друга — /referral."
+        )
+        return
+
+    await callback.message.answer(
+        f"*раскладывает чистый холст*\n\nСлотов доступно: {current_count}/{limit}. Кого создаём?",
+        reply_markup=create_character_type_keyboard()
+    )
+    await state.set_state(CreateCharacterStates.choosing_type)
+
+
+@dp.callback_query(F.data == "createchar_known")
+async def handle_createchar_known(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.answer(
+        "*приготовился слушать*\n\nНапиши имя и фамилию — известного человека или персонажа фильма/сериала/игры."
+    )
+    await state.set_state(CreateCharacterStates.waiting_known_name)
+
+
+@dp.callback_query(F.data == "createchar_custom")
+async def handle_createchar_custom(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.answer(
+        "*приготовился слушать*\n\nОпиши характер своего персонажа: кто он, как говорит, какой у него стиль и настроение."
+    )
+    await state.set_state(CreateCharacterStates.waiting_custom_description)
+
+
+@dp.message(CreateCharacterStates.waiting_known_name)
+async def handle_known_name_input(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    name = message.text.strip()
+
+    if len(name) < 2:
+        await message.answer("*приподнимает бровь*\n\nИмя слишком короткое. Попробуй ещё раз.")
+        return
+
+    await state.clear()
+    await bot.send_chat_action(message.chat.id, "typing")
+    await message.answer("*задумывается, прикуривая*\n\nДай мне минуту, изучаю личность.")
+
+    result = await generate_known_character(groq_client, GROQ_MODEL, name)
+    await _finalize_character_creation(message, user_id, result)
+
+
+@dp.message(CreateCharacterStates.waiting_custom_description)
+async def handle_custom_description_input(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    description = message.text.strip()
+
+    if len(description) < 5:
+        await message.answer("*приподнимает бровь*\n\nОписание слишком короткое. Расскажи немного подробнее.")
+        return
+
+    await state.clear()
+    await bot.send_chat_action(message.chat.id, "typing")
+    await message.answer("*задумывается, прикуривая*\n\nДай мне минуту, придумываю характер.")
+
+    result = await generate_custom_character(groq_client, GROQ_MODEL, description)
+    await _finalize_character_creation(message, user_id, result)
+
+
+async def _finalize_character_creation(message: Message, user_id: int, result: dict):
+    if not result["ok"]:
+        await message.answer(f"*качает головой*\n\n{result['error']}")
+        return
+
+    # Проверяем лимит ещё раз на случай гонки состояний
+    limit = await get_custom_character_limit(user_id)
+    current_count = await get_custom_character_count(user_id)
+    if current_count >= limit:
+        await message.answer(
+            f"*разводит руками*\n\nСлоты закончились пока думала: {current_count}/{limit}."
+        )
+        return
+
+    base_slug = slugify(result["name"])
+    slug = base_slug
+    suffix = 1
+    while await get_custom_character_by_slug(user_id, slug):
+        suffix += 1
+        slug = f"{base_slug}_{suffix}"
+
+    await add_custom_character(
+        owner_id=user_id,
+        slug=slug,
+        name=result["name"],
+        emoji=result["emoji"],
+        system_prompt=result["system_prompt"],
+        intro=result["intro"],
+    )
+
+    await set_character(user_id, f"custom:{slug}")
+
+    await message.answer(
+        f"*кладёт готовую карту на стол*\n\n"
+        f"Персонаж готов: {result['emoji']} {result['name']}. Теперь говоришь с ним."
+    )
+    await message.answer(result["intro"], reply_markup=main_reply_keyboard())
+
+
 # ===================== ПЕРСОНАЖИ =====================
 
 @dp.message(Command("character"))
@@ -264,7 +566,7 @@ async def cmd_character(message: Message):
     current = await get_character(message.from_user.id)
     await message.answer(
         "*на столе раскладывается колода масок*\n\nС кем хочешь поговорить?",
-        reply_markup=characters_inline_keyboard(current)
+        reply_markup=await characters_inline_keyboard(message.from_user.id, current)
     )
 
 
@@ -275,7 +577,7 @@ async def handle_characters_button(message: Message):
     current = await get_character(message.from_user.id)
     await message.answer(
         "*на столе раскладывается колода масок*\n\nС кем хочешь поговорить?",
-        reply_markup=characters_inline_keyboard(current)
+        reply_markup=await characters_inline_keyboard(message.from_user.id, current)
     )
 
 
@@ -291,9 +593,29 @@ async def handle_set_character(callback: CallbackQuery):
 
     await callback.message.edit_text(
         f"Теперь говоришь с: {data['emoji']} {data['name']}",
-        reply_markup=characters_inline_keyboard(key)
+        reply_markup=await characters_inline_keyboard(callback.from_user.id, key)
     )
     await callback.message.answer(data["intro"], reply_markup=main_reply_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("setcustom_"))
+async def handle_set_custom_character(callback: CallbackQuery):
+    slug = callback.data.split("_", 1)[1]
+    user_id = callback.from_user.id
+    custom = await get_custom_character_by_slug(user_id, slug)
+    if not custom:
+        await callback.answer("Этого персонажа больше нет.", show_alert=True)
+        return
+
+    character_key = f"custom:{slug}"
+    await set_character(user_id, character_key)
+
+    await callback.message.edit_text(
+        f"Теперь говоришь с: {custom['emoji']} {custom['name']}",
+        reply_markup=await characters_inline_keyboard(user_id, character_key)
+    )
+    await callback.message.answer(custom["intro"], reply_markup=main_reply_keyboard())
     await callback.answer()
 
 
@@ -512,12 +834,27 @@ async def handle_photo(message: Message):
 # ===================== ТЕКСТ =====================
 
 @dp.message(F.text)
-async def handle_message(message: Message):
+async def handle_message(message: Message, state: FSMContext):
     user_id = message.from_user.id
     user_text = message.text
 
+    # Если пользователь сейчас в процессе создания персонажа — этот хендлер не должен
+    # перехватывать сообщение (FSM-хендлеры выше зарегистрированы раньше и сработают первыми,
+    # но на случай гонки проверяем явно).
+    current_state = await state.get_state()
+    if current_state is not None:
+        return
+
     if not await require_subscription(message):
         return
+
+    # Анти-спам — после проверки подписки, чтобы не блокировать легитимный первый шаг
+    if is_rate_limited(user_id):
+        await handle_rate_limit(message)
+        return
+
+    # Стрик — считаем активность за день
+    streak_info = await touch_streak(user_id)
 
     # Угадай число
     if user_id in games.guess_states:
@@ -553,11 +890,11 @@ async def handle_message(message: Message):
             await message.answer(f"*раздражённо тушит сигарету*\n\nХолст не вышел: {e}")
         return
 
-    # Обычный чат — берём текущего персонажа пользователя
+    # Обычный чат — берём текущего персонажа пользователя (встроенного или кастомного)
     await bot.send_chat_action(message.chat.id, "typing")
 
     character_key = await get_character(user_id)
-    character_data = get_character_data(character_key)
+    character_data = await resolve_character(user_id, character_key)
     system_prompt = character_data["system_prompt"]
 
     profile = await get_profile(user_id)
@@ -577,6 +914,13 @@ async def handle_message(message: Message):
         await save_history(user_id, history, character_key)
         await message.answer(reply)
 
+        # Уведомление о новом дне стрика — отдельным коротким сообщением, не мешая основному ответу
+        if streak_info["is_new_day"] and streak_info["streak_count"] > 1:
+            await message.answer(f"🔥 Серия: {streak_info['streak_count']} {'день' if streak_info['streak_count'] == 1 else 'дней'} подряд.")
+
+        # Голосовая озвучка ответа — автоматически, в фоне, не блокируя дальнейшую работу бота
+        asyncio.create_task(_send_voice_reply(message.chat.id, reply, character_key))
+
         # Фоновое извлечение фактов о пользователе — не блокирует ответ
         asyncio.create_task(_update_profile_from_message(user_id, user_text))
 
@@ -591,6 +935,18 @@ async def handle_message(message: Message):
             await message.answer(f"*раздражённо тушит сигарету*\n\nЧто-то сломалось в этом цирке: {e}")
 
 
+async def _send_voice_reply(chat_id: int, reply_text: str, character_key: str):
+    """Генерирует и отправляет голосовое сообщение. Любая ошибка тут не должна ронять бота."""
+    try:
+        voice_character_key = character_key.split(":", 1)[1] if character_key.startswith("custom:") else character_key
+        audio_bytes = await voice.text_to_speech(reply_text, voice_character_key)
+        if audio_bytes:
+            voice_file = BufferedInputFile(audio_bytes, filename="voice.ogg")
+            await bot.send_voice(chat_id, voice_file)
+    except Exception:
+        pass
+
+
 async def _update_profile_from_message(user_id: int, user_text: str):
     """Извлекает факты в фоне и сохраняет их в профиль пользователя."""
     try:
@@ -603,11 +959,40 @@ async def _update_profile_from_message(user_id: int, user_text: str):
         pass
 
 
+# ===================== СТРИК-НАПОМИНАНИЯ (ПЛАНИРОВЩИК) =====================
+
+STREAK_REMINDER_TEXTS = [
+    "*выдыхает дым, глядя в пустоту*\n\nТебя не было вчера. Серия ещё жива — не дай ей погаснуть.",
+    "*стучит пальцами по столу*\n\nВчера тишина. Загляни — серия на грани.",
+]
+
+
+async def send_streak_reminders():
+    """Раз в день рассылает напоминания тем, кто пропустил ровно один день."""
+    import random
+    try:
+        user_ids = await get_users_missed_yesterday()
+        for user_id in user_ids:
+            try:
+                await bot.send_message(user_id, random.choice(STREAK_REMINDER_TEXTS))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 # ===================== ЗАПУСК =====================
+
+scheduler = AsyncIOScheduler()
+
 
 async def on_startup(app):
     await init_db()
     await bot.set_webhook(f"{WEBHOOK_URL}{WEBHOOK_PATH}")
+
+    # Ежедневная проверка стриков в 12:00 UTC — фиксированное простое время
+    scheduler.add_job(send_streak_reminders, "cron", hour=12, minute=0)
+    scheduler.start()
 
 
 async def health_check(request):
