@@ -59,6 +59,21 @@ MIN_GAP_SECONDS = 1.2   # минимальный промежуток между
 user_message_timestamps = {}  # user_id -> [timestamps]
 user_last_message_time = {}   # user_id -> timestamp последнего сообщения
 
+# Последний текстовый ответ персонажа на пользователя — для озвучки по запросу.
+# user_id -> {"text": str, "character_key": str}
+last_reply_by_user = {}
+
+VOICE_REQUEST_TRIGGERS = [
+    "озвучь", "озвучить", "скажи голосом", "голосом скажи",
+    "озвучь голосом", "голосовое сообщение", "пришли голосом",
+    "скажи это голосом", "произнеси", "озвучка",
+]
+
+
+def detect_voice_request(text: str) -> bool:
+    lowered = text.lower().strip()
+    return any(trigger in lowered for trigger in VOICE_REQUEST_TRIGGERS)
+
 pending_vip_payments = {}
 
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -853,6 +868,27 @@ async def handle_message(message: Message, state: FSMContext):
         await handle_rate_limit(message)
         return
 
+    # Запрос на озвучку последнего ответа — например "озвучь", "скажи голосом"
+    if detect_voice_request(user_text):
+        last_reply = last_reply_by_user.get(user_id)
+        if not last_reply:
+            await message.answer("*пожимает плечами*\n\nЕщё нечего озвучивать — сначала спроси что-нибудь.")
+            return
+        await bot.send_chat_action(message.chat.id, "record_voice")
+        try:
+            voice_character_key = last_reply["character_key"]
+            if voice_character_key.startswith("custom:"):
+                voice_character_key = voice_character_key.split(":", 1)[1]
+            audio_bytes = await voice.text_to_speech(last_reply["text"], voice_character_key)
+            if audio_bytes:
+                voice_file = BufferedInputFile(audio_bytes, filename="voice.ogg")
+                await message.answer_voice(voice_file)
+            else:
+                await message.answer("*разводит руками*\n\nНечего озвучивать — там одни ремарки без слов.")
+        except Exception as e:
+            await message.answer(f"*раздражённо тушит сигарету*\n\nГолос не получился: {e}")
+        return
+
     # Стрик — считаем активность за день
     streak_info = await touch_streak(user_id)
 
@@ -918,8 +954,8 @@ async def handle_message(message: Message, state: FSMContext):
         if streak_info["is_new_day"] and streak_info["streak_count"] > 1:
             await message.answer(f"🔥 Серия: {streak_info['streak_count']} {'день' if streak_info['streak_count'] == 1 else 'дней'} подряд.")
 
-        # Голосовая озвучка ответа — автоматически, в фоне, не блокируя дальнейшую работу бота
-        asyncio.create_task(_send_voice_reply(message.chat.id, reply, character_key))
+        # Сохраняем последний ответ — пользователь может попросить озвучить его текстом ("озвучь")
+        last_reply_by_user[user_id] = {"text": reply, "character_key": character_key}
 
         # Фоновое извлечение фактов о пользователе — не блокирует ответ
         asyncio.create_task(_update_profile_from_message(user_id, user_text))
@@ -933,18 +969,6 @@ async def handle_message(message: Message, state: FSMContext):
             )
         else:
             await message.answer(f"*раздражённо тушит сигарету*\n\nЧто-то сломалось в этом цирке: {e}")
-
-
-async def _send_voice_reply(chat_id: int, reply_text: str, character_key: str):
-    """Генерирует и отправляет голосовое сообщение. Любая ошибка тут не должна ронять бота."""
-    try:
-        voice_character_key = character_key.split(":", 1)[1] if character_key.startswith("custom:") else character_key
-        audio_bytes = await voice.text_to_speech(reply_text, voice_character_key)
-        if audio_bytes:
-            voice_file = BufferedInputFile(audio_bytes, filename="voice.ogg")
-            await bot.send_voice(chat_id, voice_file)
-    except Exception:
-        pass
 
 
 async def _update_profile_from_message(user_id: int, user_text: str):
