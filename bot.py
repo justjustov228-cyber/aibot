@@ -5,7 +5,7 @@ import urllib.parse
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, BufferedInputFile, FSInputFile
+from aiogram.types import Message, CallbackQuery, BufferedInputFile, FSInputFile, BotCommand
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -234,6 +234,21 @@ def main_reply_keyboard():
     return builder.as_markup(resize_keyboard=True)
 
 
+def main_menu_keyboard():
+    """Главное inline-меню: основные разделы бота, по 2 кнопки в ряд."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🎭 Персонажи", callback_data="menu_characters")
+    builder.button(text="➕ Создать своего", callback_data="menu_createcharacter")
+    builder.button(text="🎮 Игры", callback_data="menu_games")
+    builder.button(text="💎 Looksmax", callback_data="menu_looksmax")
+    builder.button(text="🔗 Реферал", callback_data="menu_referral")
+    builder.button(text="🔥 Серия", callback_data="menu_streak")
+    builder.button(text="🧹 Очистить чат", callback_data="menu_clear")
+    builder.button(text="🙈 Забыть меня", callback_data="menu_forget")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
 async def characters_inline_keyboard(user_id: int, current: str):
     """Inline-меню: встроенные персонажи + кастомные персонажи этого пользователя."""
     builder = InlineKeyboardBuilder()
@@ -349,16 +364,90 @@ async def cmd_start(message: Message, command: CommandObject):
 
     await message.answer(
         "*затягивается сигаретой, медленно выпуская дым*\n\n"
-        "Ещё одна душа забрела в этот балаган. Пиши, что у тебя на уме.\n\n"
-        "_/games — поиграть со мной_\n"
-        "_/looksmax — гайды по внешности_\n"
-        "_/createcharacter — создать своего персонажа_\n"
-        "_/referral — твоя реферальная ссылка_\n"
-        "_/clear — начать с чистого листа_\n"
-        "_/forget — забыть всё, что я знаю о тебе_\n\n"
-        "Кнопка «🎭 Персонажи» внизу — переключиться на другого собеседника.",
+        "Ещё одна душа забрела в этот балаган. Пиши, что у тебя на уме.",
         reply_markup=main_reply_keyboard()
     )
+    await message.answer(
+        "Выбирай раздел:",
+        reply_markup=main_menu_keyboard()
+    )
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(message: Message):
+    if not await require_subscription(message):
+        return
+    await message.answer(
+        "*раскладывает на столе колоду меню*\n\nВыбирай раздел:",
+        reply_markup=main_menu_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "menu_characters")
+async def menu_open_characters(callback: CallbackQuery):
+    await callback.answer()
+    current = await get_character(callback.from_user.id)
+    await callback.message.answer(
+        "*на столе раскладывается колода масок*\n\nС кем хочешь поговорить?",
+        reply_markup=await characters_inline_keyboard(callback.from_user.id, current)
+    )
+
+
+@dp.callback_query(F.data == "menu_createcharacter")
+async def menu_open_createcharacter(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _start_create_character_flow(callback.message, callback.from_user.id, state)
+
+
+@dp.callback_query(F.data == "menu_games")
+async def menu_open_games(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        "*выдыхает дым, кивая на стол с играми*\n\n"
+        "Просто скажи во что хочешь сыграть: крестики-нолики, угадай число, "
+        "камень-ножницы-бумага, викторина или рулетка."
+    )
+
+
+@dp.callback_query(F.data == "menu_looksmax")
+async def menu_open_looksmax(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        "*стряхивает пепел, оценивающе глядя*\n\n"
+        "Looksmaxing. Выбирай — бесплатная основа или полное VIP обучение.",
+        reply_markup=looksmax_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "menu_referral")
+async def menu_open_referral(callback: CallbackQuery):
+    await callback.answer()
+    await _send_referral_info(callback.message, callback.from_user.id)
+
+
+@dp.callback_query(F.data == "menu_streak")
+async def menu_open_streak(callback: CallbackQuery):
+    await callback.answer()
+    profile = await get_profile(callback.from_user.id)
+    streak = profile["streak_count"]
+    await callback.message.answer(
+        f"*затягивается, прикидывая в уме*\n\nТекущая серия: {streak} {'день' if streak == 1 else 'дней'} подряд."
+    )
+
+
+@dp.callback_query(F.data == "menu_clear")
+async def menu_open_clear(callback: CallbackQuery):
+    await callback.answer()
+    current = await get_character(callback.from_user.id)
+    await clear_history(callback.from_user.id, current)
+    await callback.message.answer("*щелчком отправляет окурок в пепельницу*\n\nЧистый лист. Начинаем заново.")
+
+
+@dp.callback_query(F.data == "menu_forget")
+async def menu_open_forget(callback: CallbackQuery):
+    await callback.answer()
+    await clear_profile(callback.from_user.id)
+    await callback.message.answer("*выдыхает дым, глядя сквозь тебя*\n\nЗабыла всё, что знала о тебе. Будто познакомились впервые.")
 
 
 @dp.message(Command("clear"))
@@ -391,12 +480,7 @@ async def cmd_games(message: Message):
 
 # ===================== РЕФЕРАЛЬНАЯ ПРОГРАММА =====================
 
-@dp.message(Command("referral"))
-async def cmd_referral(message: Message):
-    if not await require_subscription(message):
-        return
-
-    user_id = message.from_user.id
+async def _send_referral_info(message: Message, user_id: int):
     count = await get_referral_count(user_id)
 
     if BOT_USERNAME:
@@ -414,6 +498,13 @@ async def cmd_referral(message: Message):
     )
 
 
+@dp.message(Command("referral"))
+async def cmd_referral(message: Message):
+    if not await require_subscription(message):
+        return
+    await _send_referral_info(message, message.from_user.id)
+
+
 # ===================== СОЗДАНИЕ КАСТОМНОГО ПЕРСОНАЖА =====================
 
 def create_character_type_keyboard():
@@ -424,12 +515,7 @@ def create_character_type_keyboard():
     return builder.as_markup()
 
 
-@dp.message(Command("createcharacter"))
-async def cmd_create_character(message: Message, state: FSMContext):
-    if not await require_subscription(message):
-        return
-
-    user_id = message.from_user.id
+async def _start_create_character_flow(message: Message, user_id: int, state: FSMContext):
     limit = await get_custom_character_limit(user_id)
     current_count = await get_custom_character_count(user_id)
 
@@ -455,30 +541,17 @@ async def cmd_create_character(message: Message, state: FSMContext):
     await state.set_state(CreateCharacterStates.choosing_type)
 
 
+@dp.message(Command("createcharacter"))
+async def cmd_create_character(message: Message, state: FSMContext):
+    if not await require_subscription(message):
+        return
+    await _start_create_character_flow(message, message.from_user.id, state)
+
+
 @dp.callback_query(F.data == "create_character_start")
 async def handle_create_character_button(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    user_id = callback.from_user.id
-    limit = await get_custom_character_limit(user_id)
-    current_count = await get_custom_character_count(user_id)
-
-    if limit == 0:
-        await callback.message.answer(
-            "*качает головой*\n\nСоздание своего персонажа открывается за рефералов. Приведи друга — /referral."
-        )
-        return
-
-    if current_count >= limit:
-        await callback.message.answer(
-            f"*разводит руками*\n\nСлоты закончились: {current_count}/{limit}. Приведи ещё одного друга — /referral."
-        )
-        return
-
-    await callback.message.answer(
-        f"*раскладывает чистый холст*\n\nСлотов доступно: {current_count}/{limit}. Кого создаём?",
-        reply_markup=create_character_type_keyboard()
-    )
-    await state.set_state(CreateCharacterStates.choosing_type)
+    await _start_create_character_flow(callback.message, callback.from_user.id, state)
 
 
 @dp.callback_query(F.data == "createchar_known")
@@ -1009,10 +1082,23 @@ async def send_streak_reminders():
 
 scheduler = AsyncIOScheduler()
 
+BOT_COMMANDS = [
+    BotCommand(command="start", description="Начать с начала"),
+    BotCommand(command="menu", description="Главное меню"),
+    BotCommand(command="character", description="Выбрать персонажа"),
+    BotCommand(command="createcharacter", description="Создать своего персонажа"),
+    BotCommand(command="referral", description="Реферальная ссылка"),
+    BotCommand(command="games", description="Поиграть"),
+    BotCommand(command="looksmax", description="Гайды по внешности"),
+    BotCommand(command="clear", description="Очистить историю чата"),
+    BotCommand(command="forget", description="Забыть всё о тебе"),
+]
+
 
 async def on_startup(app):
     await init_db()
     await bot.set_webhook(f"{WEBHOOK_URL}{WEBHOOK_PATH}")
+    await bot.set_my_commands(BOT_COMMANDS)
 
     # Ежедневная проверка стриков в 12:00 UTC — фиксированное простое время
     scheduler.add_job(send_streak_reminders, "cron", hour=12, minute=0)
